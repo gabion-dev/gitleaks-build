@@ -1,0 +1,10 @@
+# build/module-upgrades.txt
+#
+# Modules raised above the go.mod of the upstream tag, one per line:
+# <module>@<version> <why>. A line exists only because the release binary
+# would otherwise call the vulnerable function of a bulletin — the
+# vulnerability gate (build/vulnerability-gate.sh) names it and fails the
+# build until the fixing version is listed here. A line the upstream tag
+# no longer needs (it already requires that version or a newer one) stops
+# build/prepare-source.sh: remove the line.
+github.com/ulikunitz/xz@v0.5.15 GO-2025-3922 (CVE-2025-58058), fixed in 0.5.15; v8.30.1 requires 0.5.12

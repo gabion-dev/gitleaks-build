@@ -1,0 +1,331 @@
+# .github/workflows/build.yml
+name: Build gitleaks
+
+on:
+  workflow_dispatch:
+    inputs:
+      gitleaks_tag:
+        description: 'gitleaks/gitleaks release tag to build (e.g. v8.30.1)'
+        required: true
+        default: 'v8.30.1'
+      revision:
+        description: 'Revision of this recipe for that tag (1, 2, …). Raise it when the recipe, the Go release or a module upgrade changed and the tag did not'
+        required: true
+        default: '1'
+
+permissions:
+  contents: read
+
+env:
+  # The Go of build/versions.sh and nothing else: a go.mod asking for a
+  # newer toolchain fails the step instead of switching it silently.
+  GOTOOLCHAIN: local
+
+# =============================================================================
+# gitleaks rebuilt from its own release tag with a supported Go release.
+# Upstream's release binaries carry the Go they were built with — a Go line
+# that no longer gets security fixes — and a module version with a known
+# vulnerability; a binary built here differs from upstream's only in the Go
+# of build/versions.sh and in the modules of build/module-upgrades.txt. The
+# recipe — flags, build tags, archive names and contents — is upstream's
+# (.goreleaser.yml at the tag).
+#
+# The scripts in build/ do the work, here and on a developer machine alike.
+# The source is prepared once per job by the same script, and every job
+# that prepares it checks its module files against the ones the binaries
+# were built from: the tests run on, and the gate judges, exactly the
+# source of the release.
+#
+# A release is published only when the source passed the vulnerability
+# gate, upstream's tests passed on Linux and macOS, and every binary passed
+# the launch check on a machine of its own system and architecture.
+# =============================================================================
+
+jobs:
+  # A published release is pinned elsewhere by the checksums of its
+  # archives, and the release step uploads into an existing tag, replacing
+  # files of the same name: building a revision that is already released
+  # would swap the pinned bytes. A changed recipe is a new revision.
+  revision:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: The revision is not released yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.inputs.gitleaks_tag }}-r${{ github.event.inputs.revision }}
+        run: |
+          set -euo pipefail
+          STATUS="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${RELEASE_TAG}")"
+          case "${STATUS}" in
+            404) echo "${RELEASE_TAG} has no release yet" ;;
+            200)
+              echo "ERROR: ${RELEASE_TAG} is already released; its archives are pinned by" \
+                "checksum and are never rebuilt. Raise the revision for a changed recipe." >&2
+              exit 1 ;;
+            *)
+              echo "ERROR: could not tell whether ${RELEASE_TAG} is released (HTTP ${STATUS})" >&2
+              exit 1 ;;
+          esac
+
+  build:
+    needs: [revision]
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Check out the recipe
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Pinned toolchain
+        id: versions
+        run: |
+          set -euo pipefail
+          . build/versions.sh
+          echo "go=${GO_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "govulncheck=${GOVULNCHECK_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: false
+
+      - name: Install govulncheck (its modules checked against the Go checksum database)
+        run: |
+          set -euo pipefail
+          go install "golang.org/x/vuln/cmd/govulncheck@${{ steps.versions.outputs.govulncheck }}"
+          echo "$(go env GOPATH)/bin" >> "${GITHUB_PATH}"
+
+      - name: Prepare the source
+        id: source
+        run: |
+          set -euo pipefail
+          bash build/prepare-source.sh "${{ github.event.inputs.gitleaks_tag }}" source
+          echo "commit=$(git -C source rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Vulnerability gate
+        run: bash build/vulnerability-gate.sh source reports
+
+      - name: Build every platform
+        run: bash build/build.sh source "${{ github.event.inputs.gitleaks_tag }}" dist
+
+      - name: Upload the release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: release
+          path: dist/
+
+      - name: Upload the govulncheck reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: govulncheck-reports
+          path: reports/
+
+  # Upstream's tests, with the release's build tags and the race detector
+  # (upstream's own test command), on the prepared source and the pinned Go.
+  test:
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the recipe
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Pinned toolchain
+        id: versions
+        run: |
+          set -euo pipefail
+          . build/versions.sh
+          echo "go=${GO_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: false
+
+      - name: Prepare the source
+        run: bash build/prepare-source.sh "${{ github.event.inputs.gitleaks_tag }}" source
+
+      - name: Download the release files
+        uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: built
+
+      - name: The source is the one the binaries were built from
+        run: cmp built/go.mod source/go.mod && cmp built/go.sum source/go.sum
+
+      - name: Upstream's tests
+        working-directory: source
+        run: |
+          set -euo pipefail
+          . ../build/engine.sh
+          go test -tags "${BUILD_TAGS}" -race ./...
+
+  # Every binary is started on a machine of its own architecture. The Linux
+  # binaries are static; they run on the runner and inside clean containers
+  # of distributions with and without glibc, each with nothing installed.
+  verify-linux:
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the recipe
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download the release files
+        uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: dist
+
+      - name: Launch on the runner and in clean containers
+        env:
+          TAG: ${{ github.event.inputs.gitleaks_tag }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="gitleaks_${TAG#v}_linux_${{ matrix.arch }}.tar.gz"
+          (cd dist && sha256sum --check "${ARCHIVE}.sha256")
+          mkdir t
+          tar -xzf "dist/${ARCHIVE}" -C t
+          cp build/launch-check.sh t/
+          sh t/launch-check.sh t/gitleaks "${TAG#v}"
+          for IMAGE in ubuntu:22.04 debian:13 fedora:latest alpine:latest; do
+            echo "::group::${IMAGE}"
+            docker run --rm -v "${PWD}/t:/t:ro" "${IMAGE}" sh /t/launch-check.sh /t/gitleaks "${TAG#v}"
+            echo "::endgroup::"
+          done
+
+  verify-macos:
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-26
+          - arch: arm64
+            runner: macos-15
+          - arch: x64
+            runner: macos-26-intel
+          - arch: x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the recipe
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download the release files
+        uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: dist
+
+      - name: Launch
+        env:
+          TAG: ${{ github.event.inputs.gitleaks_tag }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="gitleaks_${TAG#v}_darwin_${{ matrix.arch }}.tar.gz"
+          (cd dist && shasum -a 256 --check "${ARCHIVE}.sha256")
+          mkdir t
+          tar -xzf "dist/${ARCHIVE}" -C t
+          sh build/launch-check.sh t/gitleaks "${TAG#v}"
+
+  release:
+    needs: [build, test, verify-linux, verify-macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      TAG: ${{ github.event.inputs.gitleaks_tag }}
+      RELEASE_TAG: ${{ github.event.inputs.gitleaks_tag }}-r${{ github.event.inputs.revision }}
+    steps:
+      - name: Check out the recipe
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download the release files
+        uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: dist
+
+      - name: Check the files
+        run: cd dist && sha256sum --check *.sha256
+
+      # A signed statement, kept by GitHub, that these archives come from
+      # this workflow at this commit of the recipe; `gh attestation verify
+      # <archive> --repo gabion-dev/gitleaks-build` checks one.
+      - name: Attest the build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Release notes
+        run: |
+          set -euo pipefail
+          . build/versions.sh
+          COMMIT="${{ needs.build.outputs.commit }}"
+          {
+            echo "gitleaks \`${TAG#v}\` from the [gitleaks/gitleaks](https://github.com/gitleaks/gitleaks) tag \`${TAG}\` (commit \`${COMMIT}\`), built with Go ${GO_VERSION} by the recipe of this repository at this tag (revision ${{ github.event.inputs.revision }})."
+            echo
+            echo "Upstream's recipe: \`CGO_ENABLED=0\`, build tags \`gore2regex\`, \`-ldflags \"-s -w -X=github.com/zricethezav/gitleaks/v8/version.Version=${TAG#v}\"\`, plus \`-trimpath\`. Modules raised above the tag's \`go.mod\`:"
+            echo
+            grep -v -e '^#' -e '^$' build/module-upgrades.txt | sed 's/^\([^ ]*\) /- `\1` — /' || echo "- none"
+            echo
+            echo "\`go.mod\` and \`go.sum\` are the module files every binary was built from: the tag's source with these two files is the source of this release."
+            echo
+            echo "Before this release was published, govulncheck found no called vulnerable function for linux or darwin, upstream's tests passed with the release's build tags and the race detector on Ubuntu 24.04 and macOS 15, and every binary reported its version and found a planted secret: Linux x64 and ARM64 on the runner and in clean Ubuntu 22.04, Debian 13, Fedora and Alpine containers, macOS 15 and 26 on Apple Silicon and Intel."
+            echo
+            echo "## Platforms"
+            echo "- \`gitleaks_${TAG#v}_linux_x64.tar.gz\` — Linux x64 (static)"
+            echo "- \`gitleaks_${TAG#v}_linux_arm64.tar.gz\` — Linux ARM64 (static)"
+            echo "- \`gitleaks_${TAG#v}_darwin_x64.tar.gz\` — macOS 13+, Intel"
+            echo "- \`gitleaks_${TAG#v}_darwin_arm64.tar.gz\` — macOS 13+, Apple Silicon"
+            echo
+            echo "Each archive holds \`gitleaks\`, upstream's \`LICENSE\` and \`README.md\`, as upstream's archives do, and has a \`.sha256\` file next to it. The archives carry a build provenance attestation: \`gh attestation verify <archive> --repo ${{ github.repository }}\`."
+            echo
+            echo "## License"
+            echo "gitleaks is MIT-licensed; its license text is inside every archive."
+          } > notes.md
+          cat notes.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          name: gitleaks ${{ github.event.inputs.gitleaks_tag }} (recipe revision ${{ github.event.inputs.revision }})
+          body_path: notes.md
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/go.mod
+            dist/go.sum
