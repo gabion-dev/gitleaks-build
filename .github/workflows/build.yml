@@ -126,8 +126,9 @@ jobs:
           name: govulncheck-reports
           path: reports/
 
-  # Upstream's tests, with the release's build tags and the race detector
-  # (upstream's own test command), on the prepared source and the pinned Go.
+  # Upstream's tests on the prepared source and the pinned Go: upstream's own
+  # command over every package, then the binary's packages with the
+  # release's build tags (build/test.sh says why the second run is limited).
   test:
     needs: [build]
     strategy:
@@ -167,11 +168,7 @@ jobs:
         run: cmp built/go.mod source/go.mod && cmp built/go.sum source/go.sum
 
       - name: Upstream's tests
-        working-directory: source
-        run: |
-          set -euo pipefail
-          . ../build/engine.sh
-          go test -tags "${BUILD_TAGS}" -race ./...
+        run: bash build/test.sh source
 
   # Every binary is started on a machine of its own architecture. The Linux
   # binaries are static; they run on the runner and inside clean containers
@@ -302,7 +299,7 @@ jobs:
             echo
             echo "\`go.mod\` and \`go.sum\` are the module files every binary was built from: the tag's source with these two files is the source of this release."
             echo
-            echo "Before this release was published, govulncheck found no called vulnerable function for linux or darwin, upstream's tests passed with the release's build tags and the race detector on Ubuntu 24.04 and macOS 15, and every binary reported its version and found a planted secret: Linux x64 and ARM64 on the runner and in clean Ubuntu 22.04, Debian 13, Fedora and Alpine containers, macOS 15 and 26 on Apple Silicon and Intel."
+            echo "Before this release was published, govulncheck found no called vulnerable function for linux or darwin, upstream's tests passed on Ubuntu 24.04 and macOS 15 — upstream's own test command over every package, and the binary's packages with the release's build tags, both with the race detector — and every binary reported its version and found a planted secret: Linux x64 and ARM64 on the runner and in clean Ubuntu 22.04, Debian 13, Fedora and Alpine containers, macOS 15 and 26 on Apple Silicon and Intel."
             echo
             echo "## Platforms"
             echo "- \`gitleaks_${TAG#v}_linux_x64.tar.gz\` — Linux x64 (static)"

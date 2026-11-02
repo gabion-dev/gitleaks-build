@@ -69,8 +69,10 @@ alike:
    checks that each names the pinned Go, the tag's commit and the build
    tags, and that the Linux ones are static, then packs reproducible
    archives;
-4. upstream's tests run on the same source, with the release's build tags
-   and the race detector, on Ubuntu 24.04 and macOS 15;
+4. `test.sh` runs upstream's tests on the same source, on Ubuntu 24.04 and
+   macOS 15: upstream's own test command over every package, then the
+   packages the binary is built from with the release's build tags, both
+   with the race detector;
 5. `launch-check.sh` starts every binary on a machine of its own system and
    architecture: it must report the tag's version and find a planted secret
    in a directory scan. Linux x64 and ARM64 run on the runner and in clean
